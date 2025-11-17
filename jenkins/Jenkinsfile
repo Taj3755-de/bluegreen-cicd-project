@@ -2,130 +2,167 @@ pipeline {
     agent any
 
     environment {
+        APP_NAME        = "finacplus-app"
+        IMAGE_REPO      = "157314643992.dkr.ecr.us-east-1.amazonaws.com/finacplus-app"
+        KUBE_NAMESPACE  = "default"
+        DEPLOYMENT_BLUE = "finacplus-blue"
+        DEPLOYMENT_GREEN = "finacplus-green"
+        SERVICE_NAME    = "finacplus-service"
+        HEALTH_ENDPOINT = "/actuator/health"
         AWS_REGION      = "us-east-1"
-        ACCOUNT_ID      = "157314643992"
-        REPO            = "finacplus/app-01v"
-        IMAGE_URI       = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}"
-
-        K8S_MASTER      = "rocky@172.31.86.230"
-        SSH_CRED        = "kube-master-ssh"
-
-        HELM_RELEASE    = "finacplus"
-        HELM_CHART_PATH = "helm/bluegreen"
-        NAMESPACE       = "default"
     }
 
     stages {
+
+        /**********************
+         * 1. CHECKOUT CODE
+         **********************/
         stage('Checkout') {
-            steps { checkout scm }
+            steps {
+                git branch: 'main', url: 'https://github.com/your-org/your-repo.git'
+            }
         }
 
-        stage('Build and Push Image') {
+        /**********************
+         * 2. BUILD & PUSH IMAGE
+         **********************/
+        stage('Build & Push') {
             steps {
                 sh """
-                aws ecr get-login-password --region ${AWS_REGION} \
-                | docker login --username AWS --password-stdin ${IMAGE_URI}
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                      | docker login --username AWS --password-stdin ${IMAGE_REPO}
 
-                docker build -t finacplus-app -f app/Dockerfile .
-                docker tag finacplus-app:latest ${IMAGE_URI}:${BUILD_NUMBER}
-                docker push ${IMAGE_URI}:${BUILD_NUMBER}
+                    docker build -t ${APP_NAME}:${BUILD_NUMBER} .
+                    docker tag ${APP_NAME}:${BUILD_NUMBER} ${IMAGE_REPO}:${BUILD_NUMBER}
+                    docker push ${IMAGE_REPO}:${BUILD_NUMBER}
                 """
             }
         }
 
-        stage('Ensure Helm Chart Installed') {
+        /**********************
+         * 3. BLUE OR GREEN – DECISION
+         *    Only one is ACTIVE.
+         **********************/
+        stage('Determine Active Color') {
             steps {
-                sshagent([SSH_CRED]) {
-                    sh """
-                    ssh ${K8S_MASTER} "
-                        if ! kubectl get deployment app-blue -n ${NAMESPACE} >/dev/null 2>&1; then
-                            echo 'Initial Helm install: creating blue and green deployments'
-                            helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} --namespace ${NAMESPACE}
-                        else
-                            echo 'Helm chart already installed'
-                        fi
-                    "
-                    """
-                }
-            }
-        }
+                script {
+                    def blueExists = sh(script: "kubectl get deploy ${DEPLOYMENT_BLUE} -n ${KUBE_NAMESPACE} --ignore-not-found", returnStdout: true).trim()
+                    def greenExists = sh(script: "kubectl get deploy ${DEPLOYMENT_GREEN} -n ${KUBE_NAMESPACE} --ignore-not-found", returnStdout: true).trim()
 
-        stage('Detect Active Color') {
-            steps {
-                sshagent([SSH_CRED]) {
-                    script {
-                        def color = sh(
-                            script: """ssh ${K8S_MASTER} \
-                                "kubectl get svc finacplus-service -n ${NAMESPACE} -o jsonpath='{.spec.selector.color}'" """,
-                            returnStdout: true
-                        ).trim()
-
-                        env.CURRENT_COLOR = (color == "green") ? "green" : "blue"
-                        env.NEW_COLOR = (env.CURRENT_COLOR == "blue") ? "green" : "blue"
-
-                        echo "Current Live Color = ${env.CURRENT_COLOR}"
-                        echo "New Deployment Color = ${env.NEW_COLOR}"
+                    if (blueExists) {
+                        println "BLUE currently exists. GREEN will be deployed."
+                        env.TARGET = "green"
+                    } else if (greenExists) {
+                        println "GREEN exists. BLUE will be deployed."
+                        env.TARGET = "blue"
+                    } else {
+                        println "No deployments found. BLUE will be deployed first."
+                        env.TARGET = "blue"
                     }
                 }
             }
         }
 
-        stage("Helm Upgrade New Color") {
+        /**********************
+         * 4. DEPLOY TARGET COLOR
+         **********************/
+        stage('Deploy Target Color') {
             steps {
-                sshagent([SSH_CRED]) {
+                script {
+                    if (env.TARGET == "blue") {
+                        sh """
+                            kubectl apply -n ${KUBE_NAMESPACE} -f k8s/blue-deployment.yaml \
+                                --record=true
+                            kubectl set image deployment/${DEPLOYMENT_BLUE} \
+                                ${APP_NAME}=${IMAGE_REPO}:${BUILD_NUMBER} -n ${KUBE_NAMESPACE}
+                        """
+                    } else {
+                        sh """
+                            kubectl apply -n ${KUBE_NAMESPACE} -f k8s/green-deployment.yaml \
+                                --record=true
+                            kubectl set image deployment/${DEPLOYMENT_GREEN} \
+                                ${APP_NAME}=${IMAGE_REPO}:${BUILD_NUMBER} -n ${KUBE_NAMESPACE}
+                        """
+                    }
+                }
+            }
+        }
+
+        /**********************
+         * 5. HEALTH CHECK TARGET
+         **********************/
+        stage('Health Check') {
+            steps {
+                script {
+                    def deployment = env.TARGET == "blue" ? DEPLOYMENT_BLUE : DEPLOYMENT_GREEN
+
                     sh """
-                    ssh ${K8S_MASTER} "
-                        helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
-                            --namespace ${NAMESPACE} \
-                            --set image.tag=${BUILD_NUMBER} \
-                            --set newColor=${NEW_COLOR}
-                    "
+                        echo "Waiting for pods to be ready..."
+                        kubectl rollout status deploy/${deployment} -n ${KUBE_NAMESPACE} --timeout=60s
+                    """
+
+                    // Call service pod to verify health
+                    sh """
+                        POD=\$(kubectl get pods -n ${KUBE_NAMESPACE} -l app=${APP_NAME},color=${env.TARGET} -o jsonpath='{.items[0].metadata.name}')
+                        for i in {1..10}; do
+                            STATUS=\$(kubectl exec -n ${KUBE_NAMESPACE} \$POD -- curl -s http://localhost:8080${HEALTH_ENDPOINT} | jq -r '.status')
+                            if [ "\$STATUS" = "UP" ]; then
+                                echo "Health Check Passed"
+                                exit 0
+                            fi
+                            echo "Retrying health check..."
+                            sleep 5
+                        done
+                        echo "Health check FAILED"
+                        exit 1
                     """
                 }
             }
         }
 
-        stage("Health Check") {
+        /**********************
+         * 6. PROMOTE (SWITCH TRAFFIC)
+         **********************/
+        stage('Promote Deployment') {
             steps {
-                sshagent([SSH_CRED]) {
-                    sh """
-                    ssh ${K8S_MASTER} "
-                        kubectl rollout status deployment/app-${NEW_COLOR} \
-                        -n ${NAMESPACE} --timeout=60s
-                    "
-                    """
-                }
-            }
-        }
-
-        stage("Switch Traffic") {
-            steps {
-                sshagent([SSH_CRED]) {
-                    sh """
-                    ssh ${K8S_MASTER} "
-                        kubectl patch svc finacplus-service -n ${NAMESPACE} \
-                        -p '{"spec":{"selector":{"color":"${NEW_COLOR}"}}}'
-                    "
-                    """
+                script {
+                    if (env.TARGET == "blue") {
+                        sh """
+                            kubectl patch svc ${SERVICE_NAME} -n ${KUBE_NAMESPACE} \
+                              -p '{"spec":{"selector":{"app":"${APP_NAME}","color":"blue"}}}'
+                        """
+                    } else {
+                        sh """
+                            kubectl patch svc ${SERVICE_NAME} -n ${KUBE_NAMESPACE} \
+                              -p '{"spec":{"selector":{"app":"${APP_NAME}","color":"green"}}}'
+                        """
+                    }
                 }
             }
         }
     }
 
+    /**********************
+     * 7. ROLLBACK ON FAILURE
+     **********************/
     post {
-        success {
-            echo "SUCCESS: Traffic switched to ${env.NEW_COLOR}"
-        }
-
         failure {
-            echo "FAILED: Rolling back to ${env.CURRENT_COLOR}"
-            sshagent([SSH_CRED]) {
-                sh """
-                ssh ${K8S_MASTER} "
-                    kubectl patch svc finacplus-service -n ${NAMESPACE} \
-                    -p '{"spec":{"selector":{"color":"${CURRENT_COLOR}"}}}'
-                "
-                """
+            script {
+                echo "Deployment Failed. Rolling back..."
+
+                if (env.TARGET == "blue") {
+                    sh """
+                        kubectl patch svc ${SERVICE_NAME} -n ${KUBE_NAMESPACE} \
+                          -p '{"spec":{"selector":{"app":"${APP_NAME}","color":"green"}}}'
+                    """
+                } else {
+                    sh """
+                        kubectl patch svc ${SERVICE_NAME} -n ${KUBE_NAMESPACE} \
+                          -p '{"spec":{"selector":{"app":"${APP_NAME}","color":"blue"}}}'
+                    """
+                }
+
+                echo "Rollback complete. Blue-Green pipeline protected."
             }
         }
     }
