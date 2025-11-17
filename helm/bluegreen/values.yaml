@@ -1,0 +1,8 @@
+replicaCount: 2
+image:
+  repository: 157314643992.dkr.ecr.us-east-1.amazonaws.com/finacplus/app-01v
+  tag: latest
+newColor: green
+service:
+  type: ClusterIP
+  port: 80

@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-blue
+  labels:
+    color: blue
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      color: blue
+  template:
+    metadata:
+      labels:
+        color: blue
+    spec:
+      containers:
+      - name: app
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        ports:
+        - containerPort: 8080

@@ -1,0 +1,4 @@
+apiVersion: v2
+name: bluegreen
+version: 0.2.0
+description: Helm chart for true blue-green deployment
