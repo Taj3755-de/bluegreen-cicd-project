@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         APP_NAME        = "finacplus-app"
-        IMAGE_REPO      = "157314643992.dkr.ecr.us-east-1.amazonaws.com/finacplus/app-01v"
+        IMAGE_REPO      = "157314643992.dkr.ecr.us-east-1.amazonaws.com/finacplus"
         KUBE_NAMESPACE  = "default"
         DEPLOYMENT_BLUE = "finacplus-blue"
         DEPLOYMENT_GREEN = "finacplus-green"
