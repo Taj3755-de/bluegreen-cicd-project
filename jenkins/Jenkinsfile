@@ -23,7 +23,8 @@ pipeline {
         stage('Build and Push Image') {
             steps {
                 sh """
-                aws ecr get-login-password --region ${AWS_REGION}                 | docker login --username AWS --password-stdin ${IMAGE_URI}
+                aws ecr get-login-password --region ${AWS_REGION} \
+                | docker login --username AWS --password-stdin ${IMAGE_URI}
 
                 docker build -t finacplus-app -f app/Dockerfile .
                 docker tag finacplus-app:latest ${IMAGE_URI}:${BUILD_NUMBER}
@@ -32,12 +33,30 @@ pipeline {
             }
         }
 
+        stage('Ensure Helm Chart Installed') {
+            steps {
+                sshagent([SSH_CRED]) {
+                    sh """
+                    ssh ${K8S_MASTER} "
+                        if ! kubectl get deployment app-blue -n ${NAMESPACE} >/dev/null 2>&1; then
+                            echo 'Initial Helm install: creating blue and green deployments'
+                            helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} --namespace ${NAMESPACE}
+                        else
+                            echo 'Helm chart already installed'
+                        fi
+                    "
+                    """
+                }
+            }
+        }
+
         stage('Detect Active Color') {
             steps {
                 sshagent([SSH_CRED]) {
                     script {
                         def color = sh(
-                            script: """ssh ${K8S_MASTER}                                 "kubectl get svc finacplus-service -n ${NAMESPACE} -o jsonpath='{.spec.selector.color}'" """,
+                            script: """ssh ${K8S_MASTER} \
+                                "kubectl get svc finacplus-service -n ${NAMESPACE} -o jsonpath='{.spec.selector.color}'" """,
                             returnStdout: true
                         ).trim()
 
@@ -56,7 +75,10 @@ pipeline {
                 sshagent([SSH_CRED]) {
                     sh """
                     ssh ${K8S_MASTER} "
-                        helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH}                             --namespace ${NAMESPACE}                             --set image.tag=${BUILD_NUMBER}                             --set newColor=${NEW_COLOR}
+                        helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
+                            --namespace ${NAMESPACE} \
+                            --set image.tag=${BUILD_NUMBER} \
+                            --set newColor=${NEW_COLOR}
                     "
                     """
                 }
@@ -68,7 +90,8 @@ pipeline {
                 sshagent([SSH_CRED]) {
                     sh """
                     ssh ${K8S_MASTER} "
-                        kubectl rollout status deployment/app-${NEW_COLOR}                         -n ${NAMESPACE} --timeout=60s
+                        kubectl rollout status deployment/app-${NEW_COLOR} \
+                        -n ${NAMESPACE} --timeout=60s
                     "
                     """
                 }
@@ -80,7 +103,8 @@ pipeline {
                 sshagent([SSH_CRED]) {
                     sh """
                     ssh ${K8S_MASTER} "
-                        kubectl patch svc finacplus-service -n ${NAMESPACE}                         -p '{"spec":{"selector":{"color":"${NEW_COLOR}"}}}'
+                        kubectl patch svc finacplus-service -n ${NAMESPACE} \
+                        -p '{"spec":{"selector":{"color":"${NEW_COLOR}"}}}'
                     "
                     """
                 }
@@ -98,7 +122,8 @@ pipeline {
             sshagent([SSH_CRED]) {
                 sh """
                 ssh ${K8S_MASTER} "
-                    kubectl patch svc finacplus-service -n ${NAMESPACE}                     -p '{"spec":{"selector":{"color":"${CURRENT_COLOR}"}}}'
+                    kubectl patch svc finacplus-service -n ${NAMESPACE} \
+                    -p '{"spec":{"selector":{"color":"${CURRENT_COLOR}"}}}'
                 "
                 """
             }
